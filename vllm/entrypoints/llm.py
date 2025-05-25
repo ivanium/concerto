@@ -2,11 +2,13 @@
 
 import itertools
 import warnings
+from collections import deque
 from collections.abc import Sequence
 from contextlib import contextmanager
 from typing import Any, Callable, ClassVar, Optional, Union, cast, overload
 
 import cloudpickle
+import time
 import torch.nn as nn
 from tqdm.auto import tqdm
 from typing_extensions import TypeVar, deprecated
@@ -38,6 +40,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import (BeamSearchParams, GuidedDecodingParams,
                                   RequestOutputKind, SamplingParams)
+from vllm.sequence import SequenceGroup
 from vllm.transformers_utils.tokenizer import (AnyTokenizer, MistralTokenizer,
                                                get_cached_tokenizer)
 from vllm.transformers_utils.tokenizer_group import TokenizerGroup
@@ -118,7 +121,7 @@ class LLM:
         disable_async_output_proc: Disable async output processing.
             This may result in lower performance.
         hf_token: The token to use as HTTP bearer authorization for remote files
-            . If `True`, will use the token generated when running 
+            . If `True`, will use the token generated when running
             `huggingface-cli login` (stored in `~/.huggingface`).
         hf_overrides: If a dictionary, contains arguments to be forwarded to the
             HuggingFace config. If a callable, it is called to update the
@@ -492,7 +495,7 @@ class LLM:
 
         Returns:
             A list containing the results from each worker.
-        
+
         Note:
             It is recommended to use this API to only pass control messages,
             and set up data-plane communication to pass data.
@@ -1226,16 +1229,16 @@ class LLM:
         during the sleep period, before `wake_up` is called.
 
         Args:
-            level: The sleep level. Level 1 sleep will offload the model 
-                weights and discard the kv cache. The content of kv cache 
+            level: The sleep level. Level 1 sleep will offload the model
+                weights and discard the kv cache. The content of kv cache
                 is forgotten. Level 1 sleep is good for sleeping and waking
-                up the engine to run the same model again. The model weights 
-                are backed up in CPU memory. Please make sure there's enough 
-                CPU memory to store the model weights. Level 2 sleep will 
-                discard both the model weights and the kv cache. The content 
-                of both the model weights and kv cache is forgotten. Level 2 
+                up the engine to run the same model again. The model weights
+                are backed up in CPU memory. Please make sure there's enough
+                CPU memory to store the model weights. Level 2 sleep will
+                discard both the model weights and the kv cache. The content
+                of both the model weights and kv cache is forgotten. Level 2
                 sleep is good for sleeping and waking up the engine to run a
-                different model or update the model, where previous model 
+                different model or update the model, where previous model
                 weights are not needed. It reduces CPU memory pressure.
         """
         self.reset_prefix_cache()
@@ -1245,12 +1248,12 @@ class LLM:
         """
         Wake up the engine from sleep mode. See the :meth:`sleep` method
         for more details.
-        
+
         Args:
-            tags: An optional list of tags to reallocate the engine memory 
-                for specific memory allocations. Values must be in 
+            tags: An optional list of tags to reallocate the engine memory
+                for specific memory allocations. Values must be in
                 ("weights", "kv_cache",). If None, all memory is reallocated.
-                wake_up should be called with all tags (or None) before the 
+                wake_up should be called with all tags (or None) before the
                 engine is used again.
         """
         self.llm_engine.wake_up(tags)
@@ -1434,3 +1437,292 @@ class LLM:
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
         return sorted(outputs, key=lambda x: int(x.request_id))
+
+    # Concerto interfaces
+    def add_offline_dataset(
+        self,
+        prompts: Union[Union[PromptType, Sequence[PromptType]],
+                       Optional[Union[str, list[str]]]] = None,
+        sampling_params: Optional[Union[SamplingParams,
+                                        Sequence[SamplingParams]]] = None,
+        prompt_token_ids: Optional[Union[list[int], list[list[int]]]] = None,
+        lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
+        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        guided_options_request: Optional[Union[LLMGuidedOptions,
+                                               GuidedDecodingRequest]] = None,
+    ) -> None:
+        if self.llm_engine.model_config.runner_type != "generate":
+            raise ValueError("Concerto only supports generation tasks")
+        if guided_options_request is not None:
+            raise ValueError("Concerto does not support guided decoding")
+
+        if prompt_token_ids is not None:
+            parsed_prompts = self._convert_v1_inputs(
+                prompts=cast(Optional[Union[str, list[str]]], prompts),
+                prompt_token_ids=prompt_token_ids,
+            )
+        else:
+            parsed_prompts = cast(Union[PromptType, Sequence[PromptType]],
+                                  prompts)
+
+        if sampling_params is None:
+            # Use default sampling params.
+            sampling_params = self.get_default_sampling_params()
+
+        self._validate_and_add_requests(
+            prompts=parsed_prompts,
+            params=sampling_params,
+            lora_request=lora_request,
+            prompt_adapter_request=prompt_adapter_request,
+            guided_options=guided_options_request,
+            priority=[SequenceGroup.OFFLINE_PRIORITY] * len(parsed_prompts))
+
+    def run_online_trace(
+        self,
+        timestamps: list[float],
+        prompts: Union[Union[PromptType, Sequence[PromptType]],
+                       Optional[Union[str, list[str]]]] = None,
+        sampling_params: Optional[Union[SamplingParams,
+                                        Sequence[SamplingParams]]] = None,
+        prompt_token_ids: Optional[Union[list[int], list[list[int]]]] = None,
+        use_tqdm: bool = True,
+        lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
+        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        guided_options_request: Optional[Union[LLMGuidedOptions,
+                                               GuidedDecodingRequest]] = None,
+    ) -> tuple[list[RequestOutput], list[RequestOutput], list[tuple[
+            str, float, float]], list[tuple[str, float, float]], list[tuple[
+                str, float, int]], list[tuple[str, float]]]:
+        """
+        Play an online trace of requests and return the outputs."
+        """
+        if self.llm_engine.model_config.runner_type != "generate":
+            raise ValueError("Concerto only supports generation tasks")
+
+        if guided_options_request is not None:
+            raise ValueError("Concerto does not support guided decoding")
+
+        if prompt_token_ids is not None:
+            parsed_prompts = self._convert_v1_inputs(
+                prompts=cast(Optional[Union[str, list[str]]], prompts),
+                prompt_token_ids=prompt_token_ids,
+            )
+        else:
+            parsed_prompts = cast(Union[PromptType, Sequence[PromptType]],
+                                  prompts)
+
+        if (not isinstance(parsed_prompts, list)
+                or len(parsed_prompts) != len(timestamps)):
+            print(f"len(parsed_prompts): {len(parsed_prompts)}, "
+                  f"len(timestamps): {len(timestamps)}")
+            raise ValueError(
+                "The number of prompts must match the number of timestamps")
+
+        if sampling_params is None:
+            # Use default sampling params.
+            _sampling_params = self.get_default_sampling_params()
+            sampling_params = [_sampling_params] * len(parsed_prompts)
+
+        # Keep compatible with generate() interface.
+        self._validate_online_requests(
+            prompts=parsed_prompts,
+            params=sampling_params,
+            lora_request=lora_request,
+            prompt_adapter_request=prompt_adapter_request,
+            guided_options=guided_options_request,
+        )
+
+        return self._run_coserve_engine(
+            timestamps=timestamps,
+            prompts=parsed_prompts,
+            params_list=sampling_params,
+            use_tqdm=use_tqdm,
+        )
+
+    def _add_online_request(
+        self,
+        prompts: PromptType,
+        params: Union[SamplingParams, PoolingParams],
+        arrival_time: Optional[float] = None,
+    ) -> None:
+        request_id = str(next(self.request_counter))
+        self.llm_engine.add_request(
+            request_id,
+            prompts,
+            params,
+            arrival_time=arrival_time,
+            lora_request=None,
+            prompt_adapter_request=None,
+            priority=SequenceGroup.ONLINE_PRIORITY,
+        )
+
+    def _validate_online_requests(
+        self,
+        prompts: Union[PromptType, Sequence[PromptType]],
+        params: Union[SamplingParams, Sequence[SamplingParams], PoolingParams,
+                      Sequence[PoolingParams]],
+        lora_request: Optional[Union[Sequence[LoRARequest], LoRARequest]],
+        prompt_adapter_request: Optional[PromptAdapterRequest],
+        guided_options: Optional[GuidedDecodingRequest] = None,
+        priority: Optional[list[int]] = None,
+    ) -> None:
+        """
+        Concerto only: validate the online requests but not add them to the
+        engine.
+        """
+        if guided_options is not None:
+            warnings.warn(
+                "guided_options_request is deprecated, use "
+                "SamplingParams.guided_decoding instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        if isinstance(prompts, (str, dict)):
+            # Convert a single prompt to a list.
+            prompts = [prompts]
+
+        num_requests = len(prompts)
+        if isinstance(params, list) and len(params) != num_requests:
+            raise ValueError("The lengths of prompts and params "
+                             "must be the same.")
+        if isinstance(lora_request,
+                      list) and len(lora_request) != num_requests:
+            raise ValueError("The lengths of prompts and lora_request "
+                             "must be the same.")
+
+        for sp in params if isinstance(params, list) else (params, ):
+            if isinstance(sp, SamplingParams):
+                self._add_guided_params(sp, guided_options)
+
+                # We only care about the final output
+                sp.output_kind = RequestOutputKind.FINAL_ONLY
+
+    def _run_coserve_engine(
+        self,
+        timestamps: list[float],
+        prompts: Sequence[PromptType],
+        params_list: Sequence[SamplingParams],
+        use_tqdm: bool = True,
+    ) -> tuple[list[RequestOutput], list[RequestOutput], list[tuple[
+            str, float, float]], list[tuple[str, float, float]], list[tuple[
+                str, float, int]], list[tuple[str, float]]]:
+        num_new_requests = len(timestamps)
+        # Initialize tqdm.
+        if use_tqdm:
+            num_online_reqs = (self.llm_engine.get_num_unfinished_requests() +
+                               num_new_requests)
+            num_offline_reqs = (self.llm_engine.get_num_unfinished_requests(
+                offline=True))
+
+            online_pbar = tqdm(
+                total=num_online_reqs,
+                desc="Processed online prompts",
+                dynamic_ncols=True,
+                postfix=(f"est. speed input: {0:.2f} toks/s, "
+                         f"output: {0:.2f} toks/s"),
+            )
+            offline_pbar = tqdm(
+                total=num_offline_reqs,
+                desc="Processed offline prompts",
+                dynamic_ncols=True,
+                postfix=(f"est. speed input: {0:.2f} toks/s, "
+                         f"output: {0:.2f} toks/s"),
+            )
+
+        outputs: list[Union[RequestOutput, PoolingRequestOutput]] = []
+        offline_outputs: list[Union[RequestOutput, PoolingRequestOutput]] = []
+        total_in_toks, total_out_toks = 0, 0
+        offline_total_in_toks, offline_total_out_toks = 0, 0
+
+        online_ttfts, online_itls = [], []
+        offline_ft_ts, offline_pot_ts = [], []
+
+        # Run the engine.
+        request_deque = deque(zip(timestamps, prompts, params_list))
+        stt_time = time.time()
+        self.llm_engine.latency_tracker.base_ts = stt_time
+        while (self.llm_engine.has_unfinished_requests()
+               or len(request_deque) > 0):
+            while (len(request_deque) > 0
+                   and request_deque[0][0] < (time.time() - stt_time)):
+                ts, prompt, params = request_deque.popleft()
+                request_id = str(next(self.request_counter))
+                self.llm_engine.add_request(
+                    request_id,
+                    prompt,
+                    params,
+                    arrival_time=ts + stt_time,
+                    lora_request=None,
+                    prompt_adapter_request=None,
+                    priority=SequenceGroup.ONLINE_PRIORITY,
+                )
+            step_outputs = self.llm_engine.step(schedule_offline=True)
+
+            # Process online generation results.
+            for output in step_outputs:
+                if output.finished:
+                    if output.is_offline:
+                        offline_outputs.append(output)
+                    else:
+                        outputs.append(output)
+                    if use_tqdm:  # Concerto only support RequestOutput
+                        assert isinstance(output, RequestOutput)
+                        # Calculate tokens only for RequestOutput
+                        n = len(output.outputs)
+                        assert output.prompt_token_ids is not None
+                        req_id = output.request_id
+
+                        if output.is_online:
+                            total_in_toks += len(output.prompt_token_ids) * n
+                            in_spd = total_in_toks / online_pbar.format_dict[
+                                "elapsed"]
+                            total_out_toks += sum(
+                                len(stp.token_ids) for stp in output.outputs)
+                            out_spd = (total_out_toks /
+                                       online_pbar.format_dict["elapsed"])
+                            online_pbar.postfix = (
+                                f"est. speed input: {in_spd:.2f} toks/s, "
+                                f"output: {out_spd:.2f} toks/s")
+                            online_pbar.update(n)
+
+                            ttft, ts = self.llm_engine.latency_tracker.get_ttft(
+                                req_id)
+                            online_ttfts.append((req_id, ttft, ts))
+                            itl, ts = self.llm_engine.latency_tracker.get_itl(
+                                req_id)
+                            online_itls.append((req_id, itl, ts))
+                        else:
+                            offline_total_in_toks += len(
+                                output.prompt_token_ids) * n
+                            in_spd = offline_total_in_toks / offline_pbar.format_dict[
+                                "elapsed"]
+                            offline_total_out_toks += sum(
+                                len(stp.token_ids) for stp in output.outputs)
+                            out_spd = offline_total_out_toks / offline_pbar.format_dict[
+                                "elapsed"]
+                            offline_pbar.postfix = (
+                                f"est. speed input: {in_spd:.2f} toks/s, "
+                                f"output: {out_spd:.2f} toks/s")
+                            offline_pbar.update(n)
+
+                            ft_ts = self.llm_engine.latency_tracker.get_ft_ts(
+                                req_id)
+                            pot_ts = self.llm_engine.latency_tracker.get_pot_ts(
+                                req_id)
+                            offline_ft_ts.append(
+                                (req_id, ft_ts, len(output.prompt_token_ids)))
+                            offline_pot_ts.append((req_id, pot_ts))
+                        self.llm_engine.latency_tracker.untrack_req(req_id)
+
+        if use_tqdm:
+            online_pbar.close()
+            offline_pbar.close()
+        # Sort the outputs by request ID.
+        # This is necessary because some requests may be finished earlier than
+        # its previous requests.
+        outputs = sorted(outputs, key=lambda x: int(x.request_id))
+        offline_outputs = sorted(offline_outputs,
+                                 key=lambda x: int(x.request_id))
+        return (outputs, offline_outputs, online_ttfts, online_itls,
+                offline_ft_ts, offline_pot_ts)

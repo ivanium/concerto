@@ -118,6 +118,7 @@ class RequestOutput:
         encoder_prompt: Optional[str] = None,
         encoder_prompt_token_ids: Optional[list[int]] = None,
         num_cached_tokens: Optional[int] = None,
+        priority: int = SequenceGroup.ONLINE_PRIORITY,  # Concerto only
         *,
         multi_modal_placeholders: Optional[MultiModalPlaceholderDict] = None,
     ) -> None:
@@ -133,10 +134,12 @@ class RequestOutput:
         self.encoder_prompt = encoder_prompt
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
+        self.priority = priority
 
     def add(self, next_output: "RequestOutput") -> None:
         """Merge subsequent RequestOutput into this one"""
 
+        assert self.priority == next_output.priority
         self.finished |= next_output.finished
 
         for next_completion in next_output.outputs:
@@ -304,7 +307,8 @@ class RequestOutput:
             "encoder_prompt": encoder_prompt,
             "encoder_prompt_token_ids": encoder_prompt_token_ids,
             "num_cached_tokens": num_cached_tokens,
-            "multi_modal_placeholders": seq_group.multi_modal_placeholders
+            "multi_modal_placeholders": seq_group.multi_modal_placeholders,
+            "priority": seq_group.priority,
         }
 
         if use_cache:
@@ -327,7 +331,27 @@ class RequestOutput:
                 f"metrics={self.metrics}, "
                 f"lora_request={self.lora_request}, "
                 f"num_cached_tokens={self.num_cached_tokens}, "
-                f"multi_modal_placeholders={self.multi_modal_placeholders})")
+                f"multi_modal_placeholders={self.multi_modal_placeholders}, "
+                f"priority={self.priority})")
+
+    # Concerto interfaces
+    @property
+    def is_online(self) -> bool:
+        """
+        Concerto only. Check if the request is online.
+        """
+        assert (self.priority == SequenceGroup.ONLINE_PRIORITY
+                or self.priority == SequenceGroup.OFFLINE_PRIORITY)
+        return self.priority == SequenceGroup.ONLINE_PRIORITY
+
+    @property
+    def is_offline(self) -> bool:
+        """
+        Concerto only. Check if the request is offline.
+        """
+        assert (self.priority == SequenceGroup.ONLINE_PRIORITY
+                or self.priority == SequenceGroup.OFFLINE_PRIORITY)
+        return self.priority == SequenceGroup.OFFLINE_PRIORITY
 
 
 _O = TypeVar("_O", default=PoolingOutput)

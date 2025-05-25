@@ -29,6 +29,16 @@ ENABLE_ARTIFICIAL_PREEMPT = bool(
     os.getenv("VLLM_TEST_ENABLE_ARTIFICIAL_PREEMPT", False))  # noqa
 ARTIFICIAL_PREEMPTION_PROB = 0.5
 ARTIFICIAL_PREEMPTION_MAX_CNT = 500
+MAX_DEQUE_SIZE = 500
+
+
+class PriorityLevel(enum.Enum):
+    ONLINE = 0
+    OFFLINE = 1
+
+    @classmethod
+    def get_value(cls, offline: bool) -> int:
+        return cls.OFFLINE.value if offline else cls.ONLINE.value
 
 
 class PreemptionMode(enum.Enum):
@@ -121,6 +131,13 @@ class SchedulingBudget:
     def num_cached_tokens(self):
         return self._num_cached_tokens
 
+    # Concerto: reduce the token budget by the number of remaining tokens
+    def maybe_reduce_token_budget(self, num_target_tokens: int):
+        diff = self.remaining_token_budget() - num_target_tokens
+        if diff > 0:
+            self.token_budget -= diff
+        assert self.remaining_token_budget() <= num_target_tokens
+
 
 @dataclass
 class ScheduledSequenceGroup:
@@ -155,6 +172,8 @@ class SchedulerOutputs:
     # The number of requests in the running queue
     running_queue_size: int
     preempted: int
+    # Concerto: number of preempted and swapped-out offline running requests
+    num_offline_preempted: int
 
     def __post_init__(self):
         # Swap in and swap out should never happen at the same time.
@@ -201,6 +220,81 @@ class SchedulerOutputs:
             if g.seq_group.prompt_adapter_request is not None
         }
 
+    # Concerto interfaces for offline scheduling
+    @classmethod
+    def create_empty(cls) -> "SchedulerOutputs":
+        return SchedulerOutputs(
+            scheduled_seq_groups=[],
+            num_prefill_groups=0,
+            num_batched_tokens=0,
+            blocks_to_swap_in=[],
+            blocks_to_swap_out=[],
+            blocks_to_copy=[],
+            ignored_seq_groups=[],
+            num_lookahead_slots=0,
+            running_queue_size=0,
+            preempted=[],
+            num_offline_preempted=0,
+        )
+
+    @classmethod
+    def merge(cls, online_outputs: "SchedulerOutputs",
+              offline_outputs: "SchedulerOutputs") -> "SchedulerOutputs":
+        """
+        Merge the online and offline scheduling outputs.
+        """
+        if (offline_outputs.is_empty()
+                and offline_outputs.num_offline_preempted == 0):
+            return online_outputs
+
+        def _merge_seq_groups() -> GenericSequence[ScheduledSequenceGroup]:
+            """
+            Merge the prefill and decode sequence groups from online and offline
+            outputs.
+            The merged sequence groups are ordered as:
+            [online_prefill, offline_prefill, online_decode, offline_decode]
+            """
+            prefill_groups = (
+                online_outputs.scheduled_seq_groups[:online_outputs.
+                                                    num_prefill_groups] +
+                offline_outputs.scheduled_seq_groups[:offline_outputs.
+                                                     num_prefill_groups])
+            decode_groups = (
+                online_outputs.scheduled_seq_groups[online_outputs.
+                                                    num_prefill_groups:] +
+                offline_outputs.scheduled_seq_groups[offline_outputs.
+                                                     num_prefill_groups:])
+
+            return prefill_groups + decode_groups
+
+        assert (online_outputs.num_lookahead_slots ==
+                offline_outputs.num_lookahead_slots), (
+                    f"num_lookahead_slots mismatch: "
+                    f"{online_outputs.num_lookahead_slots} != "
+                    f"{offline_outputs.num_lookahead_slots}")
+
+        return cls(
+            scheduled_seq_groups=_merge_seq_groups(),
+            num_prefill_groups=online_outputs.num_prefill_groups +
+            offline_outputs.num_prefill_groups,
+            num_batched_tokens=online_outputs.num_batched_tokens +
+            offline_outputs.num_batched_tokens,
+            blocks_to_swap_in=online_outputs.blocks_to_swap_in +
+            offline_outputs.blocks_to_swap_in,
+            blocks_to_swap_out=online_outputs.blocks_to_swap_out +
+            offline_outputs.blocks_to_swap_out,
+            blocks_to_copy=online_outputs.blocks_to_copy +
+            offline_outputs.blocks_to_copy,
+            ignored_seq_groups=online_outputs.ignored_seq_groups +
+            offline_outputs.ignored_seq_groups,
+            num_lookahead_slots=online_outputs.num_lookahead_slots,
+            running_queue_size=online_outputs.running_queue_size +
+            offline_outputs.running_queue_size,
+            preempted=online_outputs.preempted + offline_outputs.preempted,
+            num_offline_preempted=online_outputs.num_offline_preempted +
+            offline_outputs.num_offline_preempted,
+        )
+
 
 @dataclass
 class SchedulerRunningOutputs:
@@ -230,6 +324,10 @@ class SchedulerRunningOutputs:
     decode_seq_groups_list: List[SequenceGroup]
     prefill_seq_groups_list: List[SequenceGroup]
 
+    # Concerto added fields for offline scheduling
+    offline_preempted: List[SequenceGroup]
+    offline_swapped_out: List[SequenceGroup]
+
     @classmethod
     def create_empty(cls) -> "SchedulerRunningOutputs":
         return SchedulerRunningOutputs(
@@ -242,6 +340,8 @@ class SchedulerRunningOutputs:
             num_lookahead_slots=0,
             decode_seq_groups_list=[],
             prefill_seq_groups_list=[],
+            offline_preempted=[],
+            offline_swapped_out=[],
         )
 
 
@@ -267,6 +367,11 @@ class SchedulerSwappedInOutputs:
     # Infeasible sequence groups.
     infeasible_seq_groups: List[SequenceGroup]
 
+    # Concerto added fields for offline scheduling
+    blocks_to_swap_out: List[Tuple[int, int]]
+    offline_preempted: List[SequenceGroup]
+    offline_swapped_out: List[SequenceGroup]
+
     @classmethod
     def create_empty(cls) -> "SchedulerSwappedInOutputs":
         return SchedulerSwappedInOutputs(
@@ -276,6 +381,9 @@ class SchedulerSwappedInOutputs:
             blocks_to_copy=[],
             num_lookahead_slots=0,
             infeasible_seq_groups=[],
+            blocks_to_swap_out=[],
+            offline_preempted=[],
+            offline_swapped_out=[],
         )
 
 
@@ -293,12 +401,20 @@ class SchedulerPrefillOutputs:
     ignored_seq_groups: List[SequenceGroup]
     num_lookahead_slots: int
 
+    # Concerto added fields for offline scheduling
+    blocks_to_swap_out: List[Tuple[int, int]]
+    offline_preempted: List[SequenceGroup]
+    offline_swapped_out: List[SequenceGroup]
+
     @classmethod
     def create_empty(cls) -> "SchedulerPrefillOutputs":
         return SchedulerPrefillOutputs(
             seq_groups=[],
             ignored_seq_groups=[],
             num_lookahead_slots=0,
+            blocks_to_swap_out=[],
+            offline_preempted=[],
+            offline_swapped_out=[],
         )
 
 
@@ -319,7 +435,9 @@ def scheduler_running_outputs_builder():
                                    blocks_to_copy=[],
                                    num_lookahead_slots=0,
                                    prefill_seq_groups_list=[],
-                                   decode_seq_groups_list=[])
+                                   decode_seq_groups_list=[],
+                                   offline_preempted=[],
+                                   offline_swapped_out=[])
 
 
 def scheduled_seq_group_builder():
@@ -464,15 +582,23 @@ class Scheduler:
             enable_caching=self.cache_config.enable_prefix_caching,
         )
 
+        # Concerto: separate queues for online and offline requests
         # Sequence groups in the WAITING state.
         # Contain new prefill or preempted requests.
-        self.waiting: Deque[SequenceGroup] = deque()
+        self.waiting_qs: Sequence[Deque[SequenceGroup]] = [
+            deque() for _ in range(len(PriorityLevel))
+        ]
         # Sequence groups in the RUNNING state.
         # Contain decode requests.
-        self.running: Deque[SequenceGroup] = deque()
+        self.running_qs: Sequence[Deque[SequenceGroup]] = [
+            deque() for _ in range(len(PriorityLevel))
+        ]
         # Sequence groups in the SWAPPED state.
         # Contain decode requests that are swapped out.
-        self.swapped: Deque[SequenceGroup] = deque()
+        self.swapped_qs: Sequence[Deque[SequenceGroup]] = [
+            deque() for _ in range(len(PriorityLevel))
+        ]
+
         # Sequence groups finished requests ids since last step iteration.
         # It lets the model know that any state associated with these requests
         # can and must be released after the current step.
@@ -497,8 +623,9 @@ class Scheduler:
 
         # Used to cache python objects
         self._seq_group_metadata_cache: List[PyObjectCache] = []
-        self._scheduler_running_outputs_cache: List[PyObjectCache] = []
-        self._scheduled_seq_group_cache: List[PyObjectCache] = []
+        # Concerto: separate caches for online and offline
+        self._scheduler_running_outputs_cache: List[List[PyObjectCache]] = []
+        self._scheduled_seq_group_cache: List[List[PyObjectCache]] = []
 
         # For async output processing, we need to swap cache buffers between
         # iterations. I.e. since the output processing is lagged one step,
@@ -512,10 +639,14 @@ class Scheduler:
         for i in range(self.num_cache_iters):
             self._seq_group_metadata_cache.append(
                 PyObjectCache(seq_group_metadata_builder))
-            self._scheduler_running_outputs_cache.append(
-                PyObjectCache(scheduler_running_outputs_builder))
-            self._scheduled_seq_group_cache.append(
-                PyObjectCache(scheduled_seq_group_builder))
+            self._scheduler_running_outputs_cache.append([
+                PyObjectCache(scheduler_running_outputs_builder)
+                for _ in range(len(PriorityLevel))
+            ])
+            self._scheduled_seq_group_cache.append([
+                PyObjectCache(scheduled_seq_group_builder)
+                for _ in range(len(PriorityLevel))
+            ])
 
         # For async postprocessor, the extra decode run cannot be done
         # when the request reaches max_model_len. In this case, the request
@@ -550,17 +681,20 @@ class Scheduler:
 
     def add_seq_group(self, seq_group: SequenceGroup) -> None:
         # Add sequence groups to the waiting queue.
-        self.waiting.append(seq_group)
+        priority = PriorityLevel.get_value(seq_group.is_offline)
+        self.waiting_qs[priority].append(seq_group)
 
     def _add_seq_group_to_running(self, seq_group: SequenceGroup) -> None:
         # Add sequence groups to the running queue.
         # Only for testing purposes.
-        self.running.append(seq_group)
+        priority = PriorityLevel.get_value(seq_group.is_offline)
+        self.running_qs[priority].append(seq_group)
 
     def _add_seq_group_to_swapped(self, seq_group: SequenceGroup) -> None:
         # Add sequence groups to the swapped queue.
         # Only for testing purposes.
-        self.swapped.append(seq_group)
+        priority = PriorityLevel.get_value(seq_group.is_offline)
+        self.swapped_qs[priority].append(seq_group)
 
     def abort_seq_group(
         self,
@@ -584,7 +718,11 @@ class Scheduler:
             request_id = (request_id, )
         request_ids = set(request_id)
         seq_id_to_seq_group = seq_id_to_seq_group or {}
-        for state_queue in [self.waiting, self.running, self.swapped]:
+        for state_queue in [
+                *self.waiting_qs,
+                *self.running_qs,
+                *self.swapped_qs,
+        ]:
             aborted_groups: List[SequenceGroup] = []
             for seq_group in state_queue:
                 # When n>1, seq_group.request_id looks like
@@ -627,9 +765,11 @@ class Scheduler:
         if seq_group.is_encoder_decoder():
             self.block_manager.free_cross(seq_group)
 
-    def has_unfinished_seqs(self) -> bool:
-        return (len(self.waiting) != 0 or len(self.running) != 0
-                or len(self.swapped) != 0)
+    def has_unfinished_seqs(self, offline: bool = False) -> bool:
+        priority = PriorityLevel.get_value(offline)
+        return (len(self.waiting_qs[priority]) != 0
+                or len(self.running_qs[priority]) != 0
+                or len(self.swapped_qs[priority]) != 0)
 
     def get_prefix_cache_hit_rate(self, device: Device) -> float:
         return self.block_manager.get_prefix_cache_hit_rate(device)
@@ -637,8 +777,11 @@ class Scheduler:
     def reset_prefix_cache(self, device: Optional[Device] = None) -> bool:
         return self.block_manager.reset_prefix_cache(device)
 
-    def get_num_unfinished_seq_groups(self) -> int:
-        return len(self.waiting) + len(self.running) + len(self.swapped)
+    def get_num_unfinished_seq_groups(self, offline: bool = False) -> int:
+        priority = PriorityLevel.get_value(offline)
+        return (len(self.waiting_qs[priority]) +
+                len(self.running_qs[priority]) +
+                len(self.swapped_qs[priority]))
 
     def get_and_reset_finished_requests_ids(self) -> List[str]:
         """Flushes the list of request ids of previously finished seq_groups."""
@@ -652,6 +795,8 @@ class Scheduler:
         curr_loras: Optional[Set[int]],
         enable_chunking: bool = False,
         partial_prefill_metadata: Optional[PartialPrefillMetadata] = None,
+        priority_level: PriorityLevel = PriorityLevel.ONLINE,
+        preempt_offline: bool = False,
     ) -> SchedulerRunningOutputs:
         """Schedule sequence groups that are running.
 
@@ -667,19 +812,28 @@ class Scheduler:
                 `budget.num_batched_tokens` has not enough capacity to schedule
                 all tokens.
             partial_prefill_metadata: information about the partial prefills
-            that are currently running
+                that are currently running
+            Concerto added fields:
+            priority_level: 0 (online) or 1 (offline)
+            preempt_offline: If True, preempt offline requests to make room for
+                online requests.
 
         Returns:
             SchedulerRunningOutputs.
         """
+        assert not preempt_offline or priority_level != PriorityLevel.OFFLINE, \
+            "cannot set `preempt_offline` for offline scheduling"
+
         ret: SchedulerRunningOutputs = self._scheduler_running_outputs_cache[
-            self.cache_id].get_object()
+            self.cache_id][priority_level.value].get_object()
         ret.blocks_to_swap_out.clear()
         ret.blocks_to_copy.clear()
         ret.decode_seq_groups.clear()
         ret.prefill_seq_groups.clear()
         ret.preempted.clear()
         ret.swapped_out.clear()
+        ret.offline_preempted.clear()
+        ret.offline_swapped_out.clear()
 
         ret.num_lookahead_slots = self._get_num_lookahead_slots(
             is_prefill=False, enable_chunking=enable_chunking)
@@ -696,8 +850,10 @@ class Scheduler:
             ScheduledSequenceGroup] = ret.prefill_seq_groups
         preempted: List[SequenceGroup] = ret.preempted
         swapped_out: List[SequenceGroup] = ret.swapped_out
+        offline_preempted: List[SequenceGroup] = ret.offline_preempted
+        offline_swapped_out: List[SequenceGroup] = ret.offline_swapped_out
 
-        running_queue = self.running
+        running_queue = self.running_qs[priority_level.value]
         assert len(self._async_stopped) == 0
         while running_queue:
             seq_group = running_queue[0]
@@ -720,6 +876,14 @@ class Scheduler:
             num_running_tokens = num_uncached_new_tokens
             if num_running_tokens == 0:
                 # No budget => Stop
+                break
+
+            # Concerto: check if the sequence group can be scheduled
+            num_new_seqs = seq_group.get_max_num_running_seqs()
+            if not budget.can_schedule(
+                    num_new_tokens=num_running_tokens,
+                    num_new_seqs=num_new_seqs,
+            ):
                 break
 
             running_queue.popleft()
@@ -748,7 +912,10 @@ class Scheduler:
 
                 # Determine victim sequence
                 cont_loop = True
-                if running_queue:
+                if (preempt_offline and seq_group.is_online
+                        and self.offline_running):
+                    victim_seq_group = self.offline_running.pop()
+                elif running_queue:
                     # Preempt the lowest-priority sequence group.
                     victim_seq_group = running_queue.pop()
                 else:
@@ -778,9 +945,15 @@ class Scheduler:
                     preempted_mode = self._preempt(victim_seq_group,
                                                    blocks_to_swap_out)
                     if preempted_mode == PreemptionMode.RECOMPUTE:
-                        preempted.append(victim_seq_group)
+                        if victim_seq_group.is_offline:
+                            offline_preempted.append(victim_seq_group)
+                        else:
+                            preempted.append(victim_seq_group)
                     else:
-                        swapped_out.append(victim_seq_group)
+                        if victim_seq_group.is_offline:
+                            offline_swapped_out.append(victim_seq_group)
+                        else:
+                            swapped_out.append(victim_seq_group)
 
                 if not cont_loop:
                     break
@@ -789,8 +962,8 @@ class Scheduler:
                 is_prefill = seq_group.is_prefill()
 
                 scheduled_seq_group: ScheduledSequenceGroup = (
-                    self._scheduled_seq_group_cache[
-                        self.cache_id].get_object())
+                    self._scheduled_seq_group_cache[self.cache_id][
+                        priority_level.value].get_object())
                 scheduled_seq_group.seq_group = seq_group
                 if is_prefill:
                     scheduled_seq_group.token_chunk_size = num_running_tokens
@@ -813,8 +986,10 @@ class Scheduler:
                 if curr_loras is not None and seq_group.lora_int_id > 0:
                     curr_loras.add(seq_group.lora_int_id)
 
-        self._scheduler_running_outputs_cache[self.next_cache_id].reset()
-        self._scheduled_seq_group_cache[self.next_cache_id].reset()
+        self._scheduler_running_outputs_cache[self.next_cache_id][
+            priority_level.value].reset()
+        self._scheduled_seq_group_cache[self.next_cache_id][
+            priority_level.value].reset()
 
         return ret
 
@@ -823,6 +998,9 @@ class Scheduler:
         budget: SchedulingBudget,
         curr_loras: Optional[Set[int]],
         enable_chunking: bool = False,
+        # Concerto added fields:
+        priority_level: PriorityLevel = PriorityLevel.ONLINE,
+        preempt_offline: bool = False,
     ) -> SchedulerSwappedInOutputs:
         """Schedule sequence groups that are swapped out.
 
@@ -839,10 +1017,17 @@ class Scheduler:
                 chunked number of tokens are scheduled  if
                 `budget.num_batched_tokens` has not enough capacity to schedule
                 all tokens.
+            Concerto added fields:
+            priority_level: 0 (online) or 1 (offline)
+            preempt_offline: If True, preempt offline requests to make room for
+                online requests.
 
         Returns:
             SchedulerSwappedInOutputs.
         """
+        assert not preempt_offline or priority_level != PriorityLevel.OFFLINE, \
+            "cannot set `preempt_offline` for offline scheduling"
+
         # Blocks that need to be swapped or copied before model execution.
         blocks_to_swap_in: List[Tuple[int, int]] = []
         blocks_to_copy: List[Tuple[int, int]] = []
@@ -850,7 +1035,12 @@ class Scheduler:
         prefill_seq_groups: List[ScheduledSequenceGroup] = []
         infeasible_seq_groups: List[SequenceGroup] = []
 
-        swapped_queue = self.swapped
+        # Concerto added fields for offline scheduling
+        blocks_to_swap_out: List[Tuple[int, int]] = []
+        offline_preempted: List[SequenceGroup] = []
+        offline_swapped_out: List[SequenceGroup] = []
+
+        swapped_queue = self.swapped_qs[priority_level.value]
 
         leftover_swapped: Deque[SequenceGroup] = deque()
         while swapped_queue:
@@ -862,7 +1052,11 @@ class Scheduler:
                 seq_group,
                 self._get_num_lookahead_slots(is_prefill, enable_chunking))
             if alloc_status == AllocStatus.LATER:
-                break
+                if (not preempt_offline or seq_group.is_offline
+                        or not self._preempt_offline_under_kv_pressure(
+                            seq_group, blocks_to_swap_out, offline_preempted,
+                            offline_swapped_out)):
+                    break
             elif alloc_status == AllocStatus.NEVER:
                 logger.warning(
                     "Failing the request %s because there's not enough kv "
@@ -934,6 +1128,9 @@ class Scheduler:
             num_lookahead_slots=self._get_num_lookahead_slots(
                 is_prefill=False, enable_chunking=enable_chunking),
             infeasible_seq_groups=infeasible_seq_groups,
+            blocks_to_swap_out=blocks_to_swap_out,
+            offline_preempted=offline_preempted,
+            offline_swapped_out=offline_swapped_out,
         )
 
     def _get_prompt_limit(self, seq_group: SequenceGroup) -> int:
@@ -977,6 +1174,7 @@ class Scheduler:
         Returns:
             A count of priority-based preemptions.
         """
+        assert self.scheduler_config.policy == "priority"
 
         waiting_queue = self.waiting
 
@@ -1025,8 +1223,8 @@ class Scheduler:
 
         waiting_queue = deque(sorted(waiting_queue, key=self._get_priority))
 
-        self.waiting = waiting_queue
-        self.running = running_queue
+        self.waiting_qs[PriorityLevel.ONLINE.value] = waiting_queue
+        self.running_qs[PriorityLevel.ONLINE.value] = running_queue
         return force_preemption_count
 
     def _schedule_prefills(
@@ -1035,6 +1233,8 @@ class Scheduler:
         curr_loras: Optional[Set[int]],
         enable_chunking: bool = False,
         partial_prefill_metadata: Optional[PartialPrefillMetadata] = None,
+        priority_level: PriorityLevel = PriorityLevel.ONLINE,
+        preempt_offline: bool = False,
     ) -> SchedulerPrefillOutputs:
         """Schedule sequence groups that are in prefill stage.
 
@@ -1057,10 +1257,17 @@ class Scheduler:
                 all tokens.
             partial_prefill_metadata: information about the partial prefills
                 that are currently running
+            Concerto added fields:
+            priority_level: 0 (online) or 1 (offline)
+            preempt_offline: If True, preempt offline requests to make room for
+                online requests.
 
         Returns:
             SchedulerPrefillOutputs.
         """
+        assert not preempt_offline or priority_level != PriorityLevel.OFFLINE, \
+            "cannot set `preempt_offline` for offline scheduling"
+
         if budget.remaining_token_budget() == 0:
             # Do nothing: Can't add any more prefill anyway
             return SchedulerPrefillOutputs(
@@ -1068,13 +1275,28 @@ class Scheduler:
                 ignored_seq_groups=[],
                 num_lookahead_slots=self._get_num_lookahead_slots(
                     is_prefill=True, enable_chunking=enable_chunking),
+                blocks_to_swap_out=[],
+                offline_preempted=[],
+                offline_swapped_out=[],
             )
         ignored_seq_groups: List[SequenceGroup] = []
         seq_groups: List[ScheduledSequenceGroup] = []
+        # Concerto added fields for offline scheduling
+        blocks_to_swap_out: List[Tuple[int, int]] = []
+        offline_preempted: List[SequenceGroup] = []
+        offline_swapped_out: List[SequenceGroup] = []
 
-        waiting_queue = self.waiting
-
+        waiting_queue = self.waiting_qs[priority_level.value]
         leftover_waiting_sequences: Deque[SequenceGroup] = deque()
+        # If the waiting queue is too long, we only schedule the first
+        # MAX_DEQUE_SIZE requests. The remaining requests are stored in
+        # remainder_waiting_sequences.
+        remainder_waiting_sequences: Deque[SequenceGroup] = deque()
+        max_sched_deque_size = min(MAX_DEQUE_SIZE, len(waiting_queue))
+        if max_sched_deque_size < len(waiting_queue):
+            for _ in range(max_sched_deque_size):
+                remainder_waiting_sequences.appendleft(waiting_queue.pop())
+
         while self._passed_delay(time.time()) and waiting_queue:
             seq_group = waiting_queue[0]
 
@@ -1124,7 +1346,11 @@ class Scheduler:
             can_allocate = self.block_manager.can_allocate(
                 seq_group, num_lookahead_slots=num_lookahead_slots)
             if can_allocate == AllocStatus.LATER:
-                break
+                if (not preempt_offline or seq_group.is_offline
+                        or not self._preempt_offline_under_kv_pressure(
+                            seq_group, blocks_to_swap_out, offline_preempted,
+                            offline_swapped_out)):
+                    break
             elif can_allocate == AllocStatus.NEVER:
                 logger.warning(
                     "Input prompt (%d tokens) + lookahead slots (%d) is "
@@ -1206,6 +1432,7 @@ class Scheduler:
 
         # Queue requests that couldn't be scheduled.
         waiting_queue.extendleft(leftover_waiting_sequences)
+        waiting_queue.extend(remainder_waiting_sequences)
         if len(seq_groups) > 0:
             self.prev_prompt = True
 
@@ -1214,6 +1441,9 @@ class Scheduler:
             ignored_seq_groups=ignored_seq_groups,
             num_lookahead_slots=self._get_num_lookahead_slots(
                 is_prefill=True, enable_chunking=enable_chunking),
+            blocks_to_swap_out=blocks_to_swap_out,
+            offline_preempted=offline_preempted,
+            offline_swapped_out=offline_swapped_out,
         )
 
     def _schedule_default(self) -> SchedulerOutputs:
@@ -1336,10 +1566,27 @@ class Scheduler:
         inter token latency because decodes requests don't need to be blocked
         by prefill requests.
         """
+        assert len(self.offline_running) + len(self.offline_waiting) == 0
         budget = SchedulingBudget(
             token_budget=self.scheduler_config.max_num_batched_tokens,
             max_num_seqs=self.scheduler_config.max_num_seqs,
         )
+        return self._schedule_chunked_prefill_impl(budget)
+
+    def _schedule_chunked_prefill_impl(
+            self,
+            budget: SchedulingBudget,
+            priority_level: PriorityLevel = PriorityLevel.ONLINE,
+            preempt_offline: bool = False) -> SchedulerOutputs:
+        assert not preempt_offline or priority_level != PriorityLevel.OFFLINE, \
+            "cannot set `preempt_offline` for offline scheduling"
+
+        if budget.num_batched_tokens + budget.num_cached_tokens > 0:
+            num_already_batched_tokens = (budget.num_batched_tokens +
+                                          budget.num_cached_tokens)
+        else:
+            num_already_batched_tokens = 0
+
         curr_loras: Set[int] = set()
 
         prefills = SchedulerPrefillOutputs.create_empty()
@@ -1347,8 +1594,8 @@ class Scheduler:
 
         # Create partial prefill metadata
         partial_prefill_metadata = PartialPrefillMetadata.from_queues(
-            running=self.running,
-            waiting=self.waiting,
+            running=self.running_qs[priority_level.value],
+            waiting=self.waiting_qs[priority_level.value],
             scheduler_config=self.scheduler_config,
         )
 
@@ -1358,19 +1605,28 @@ class Scheduler:
             curr_loras,
             enable_chunking=True,
             partial_prefill_metadata=partial_prefill_metadata,
+            priority_level=priority_level,
+            preempt_offline=preempt_offline,
         )
 
         # Schedule swapped out requests.
         # If preemption happens, it means we don't have space for swap-in.
         if len(running_scheduled.preempted) + len(
                 running_scheduled.swapped_out) == 0:
-            swapped_in = self._schedule_swapped(budget, curr_loras)
+            swapped_in = self._schedule_swapped(
+                budget,
+                curr_loras,
+                priority_level=priority_level,
+                preempt_offline=preempt_offline,
+            )
 
         prefills = self._schedule_prefills(
             budget,
             curr_loras,
             enable_chunking=True,
             partial_prefill_metadata=partial_prefill_metadata,
+            priority_level=priority_level,
+            preempt_offline=preempt_offline,
         )
 
         assert (budget.num_batched_tokens
@@ -1378,17 +1634,18 @@ class Scheduler:
         assert budget.num_curr_seqs <= self.scheduler_config.max_num_seqs
 
         # Update waiting requests.
-        self.waiting.extendleft(running_scheduled.preempted)
+        self.waiting_qs[priority_level.value].extendleft(
+            running_scheduled.preempted)
 
         # Update new running requests.
         # By default, vLLM scheduler prioritizes prefills.
         # Once chunked prefill is enabled,
         # the policy is changed to prioritize decode requests.
-        self.running.extend(
+        self.running_qs[priority_level.value].extend(
             [s.seq_group for s in swapped_in.decode_seq_groups])
-        self.running.extend(
+        self.running_qs[priority_level.value].extend(
             [s.seq_group for s in swapped_in.prefill_seq_groups])
-        self.running.extend(
+        self.running_qs[priority_level.value].extend(
             [s.seq_group for s in running_scheduled.decode_seq_groups])
         # Because multiple prefills may be running concurrently, we need to
         # make sure that prefills which are scheduled to finish are listed
@@ -1396,13 +1653,15 @@ class Scheduler:
         # iteration when they have transitioned to the decode stage, they are
         # properly prioritized over sequences that are still in the prefill
         # stage.
-        self.running.extend(
+        self.running_qs[priority_level.value].extend(
             self._order_finishing_prefills_first(
                 running_scheduled.prefill_seq_groups))
-        self.running.extend([s.seq_group for s in prefills.seq_groups])
+        self.running_qs[priority_level.value].extend(
+            [s.seq_group for s in prefills.seq_groups])
 
         # Update swapped requests.
-        self.swapped.extend(running_scheduled.swapped_out)
+        self.swapped_qs[priority_level.value].extend(
+            running_scheduled.swapped_out)
         # Put prefills first due to Attention backend ordering assumption.
         scheduled_seq_groups = (prefills.seq_groups +
                                 running_scheduled.prefill_seq_groups +
@@ -1424,18 +1683,71 @@ class Scheduler:
             scheduled_seq_groups=scheduled_seq_groups,
             num_prefill_groups=num_prefill_groups,
             num_batched_tokens=budget.num_batched_tokens +
-            budget.num_cached_tokens,
+            budget.num_cached_tokens - num_already_batched_tokens,
             blocks_to_swap_in=swapped_in.blocks_to_swap_in,
-            blocks_to_swap_out=running_scheduled.blocks_to_swap_out,
+            blocks_to_swap_out=running_scheduled.blocks_to_swap_out +
+            swapped_in.blocks_to_swap_out + prefills.blocks_to_swap_out,
             blocks_to_copy=running_scheduled.blocks_to_copy +
             swapped_in.blocks_to_copy,
             ignored_seq_groups=prefills.ignored_seq_groups +
             swapped_in.infeasible_seq_groups,
             num_lookahead_slots=num_lookahead_slots,
-            running_queue_size=len(self.running),
+            running_queue_size=len(self.running_qs[priority_level.value]),
             preempted=(len(running_scheduled.preempted) +
                        len(running_scheduled.swapped_out)),
+            num_offline_preempted=len(running_scheduled.offline_preempted) +
+            len(running_scheduled.offline_swapped_out) +
+            len(swapped_in.offline_preempted) +
+            len(swapped_in.offline_swapped_out) +
+            len(prefills.offline_preempted) +
+            len(prefills.offline_swapped_out),
         )
+
+    def _schedule_concerto(
+        self,
+        schedule_offline: bool = False,
+    ) -> SchedulerOutputs:
+        budget = SchedulingBudget(
+            token_budget=self.scheduler_config.max_num_batched_tokens,
+            max_num_seqs=self.scheduler_config.max_num_seqs,
+        )
+
+        # (1) Online scheduling
+        online_outputs = self._schedule_chunked_prefill_impl(
+            budget, priority_level=PriorityLevel.ONLINE, preempt_offline=True)
+        assert online_outputs.num_batched_tokens <= budget.num_batched_tokens, \
+            "online scheduling should not exceed the token budget"
+
+        # (2) Offline scheduling
+        if schedule_offline and online_outputs.num_offline_preempted == 0:
+            offline_outputs = self._schedule_chunked_prefill_impl(
+                budget,
+                priority_level=PriorityLevel.OFFLINE,
+                preempt_offline=False)
+        else:
+            offline_outputs = SchedulerOutputs.create_empty()
+
+        # (3) Merge online and offline outputs
+        merged_outputs = SchedulerOutputs.merge(
+            online_outputs,
+            offline_outputs,
+        )
+        assert merged_outputs.num_batched_tokens <= budget.num_batched_tokens, \
+            "merged scheduling should not exceed the token budget"
+
+        return merged_outputs
+
+    def _schedule_coserve_nonpreempt(
+        self,
+        schedule_offline: bool = False,
+    ) -> SchedulerOutputs:
+        pass
+
+    def _schedule_coserve_preempt(
+        self,
+        schedule_offline: bool = False,
+    ) -> SchedulerOutputs:
+        pass
 
     def _order_finishing_prefills_first(
         self, scheduled_prefill_seqs: List[ScheduledSequenceGroup]
@@ -1452,11 +1764,26 @@ class Scheduler:
         ]
         return finishing + not_finishing
 
-    def _schedule(self) -> SchedulerOutputs:
+    def _schedule(self, schedule_offline: bool = False) -> SchedulerOutputs:
         """Schedule queued requests."""
         if self.scheduler_config.chunked_prefill_enabled:
-            return self._schedule_chunked_prefill()
+            if self.scheduler_config.policy in ["fcfs", "priority"]:
+                assert not schedule_offline, \
+                    "Chunked prefill does not support offline scheduling"
+                return self._schedule_chunked_prefill()
+            elif self.scheduler_config.policy == "concerto":
+                return self._schedule_concerto(schedule_offline)
+            elif self.scheduler_config.policy == "coserve-nonpreempt":
+                return self._schedule_coserve_nonpreempt(schedule_offline)
+            elif self.scheduler_config.policy == "coserve-preempt":
+                return self._schedule_coserve_preempt(schedule_offline)
+            else:
+                raise ValueError("Unknown scheduling policy: "
+                                 f"{self.scheduler_config.policy}")
         else:
+            assert self.scheduler_config.policy not in [
+                "concerto", "coserve-nonpreempt", "coserve-preempt"
+            ], "Concerto does not support non-chunked prefill policies"
             return self._schedule_default()
 
     def _can_append_slots(self, seq_group: SequenceGroup,
@@ -1491,14 +1818,15 @@ class Scheduler:
         return no_single_seq
 
     def schedule(
-            self
+        self,
+        schedule_offline: bool = False
     ) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs, bool]:
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
         # such as self.running, self.swapped, and self.waiting.
         scheduler_start_time = time.perf_counter()
 
-        scheduler_outputs: SchedulerOutputs = self._schedule()
+        scheduler_outputs: SchedulerOutputs = self._schedule(schedule_offline)
         now = time.time()
 
         if not self.cache_config.enable_prefix_caching:
@@ -1676,13 +2004,14 @@ class Scheduler:
         self._free_finished_seqs(seq_group)
 
     def free_finished_seq_groups(self) -> None:
-        remaining: Deque[SequenceGroup] = deque()
-        for seq_group in self.running:
-            self._free_finished_seq_group(seq_group)
-            if not seq_group.is_finished():
-                remaining.append(seq_group)
+        for priority in range(len(self.running_qs)):
+            remaining: Deque[SequenceGroup] = deque()
+            for seq_group in self.running_qs[priority]:
+                self._free_finished_seq_group(seq_group)
+                if not seq_group.is_finished():
+                    remaining.append(seq_group)
 
-        self.running = remaining
+            self.running_qs[priority] = remaining
 
         # Handle async stopped sequence groups
         # (ones that reached max model len)
@@ -1836,12 +2165,13 @@ class Scheduler:
             self.last_prompt_latency = now - self.prev_time
         self.prev_time, self.prev_prompt = now, False
         # Delay scheduling prompts to let waiting queue fill up
-        if self.scheduler_config.delay_factor > 0 and self.waiting:
+        if self.scheduler_config.delay_factor > 0 and (any(self.waiting_qs)):
             earliest_arrival_time = min(
-                [e.metrics.arrival_time for e in self.waiting])
+                [e.metrics.arrival_time for q in self.waiting_qs for e in q])
             passed_delay = ((now - earliest_arrival_time)
                             > (self.scheduler_config.delay_factor *
-                               self.last_prompt_latency) or not self.running)
+                               self.last_prompt_latency)
+                            or (not any(self.running_qs)))
         else:
             passed_delay = True
         return passed_delay
@@ -2059,3 +2389,84 @@ class Scheduler:
                              prefill_slot_budget)
 
         return num_new_tokens
+
+    # Concerto util functions
+    @property
+    def running(self) -> Deque[SequenceGroup]:
+        return self.running_qs[PriorityLevel.ONLINE.value]
+
+    @property
+    def offline_running(self) -> Deque[SequenceGroup]:
+        return self.running_qs[PriorityLevel.OFFLINE.value]
+
+    @property
+    def swapped(self) -> Deque[SequenceGroup]:
+        return self.swapped_qs[PriorityLevel.ONLINE.value]
+
+    @property
+    def offline_swapped(self) -> Deque[SequenceGroup]:
+        return self.swapped_qs[PriorityLevel.OFFLINE.value]
+
+    @property
+    def waiting(self) -> Deque[SequenceGroup]:
+        return self.waiting_qs[PriorityLevel.ONLINE.value]
+
+    @property
+    def offline_waiting(self) -> Deque[SequenceGroup]:
+        return self.waiting_qs[PriorityLevel.OFFLINE.value]
+
+    def _preempt_offline_under_kv_pressure(
+            self, seq_group: SequenceGroup,
+            blocks_to_swap_out: List[Tuple[int, int]],
+            offline_preempted: List[SequenceGroup],
+            offline_swapped_out: List[SequenceGroup]) -> bool:
+        """
+        Preempt offline requests until there's enough room for incoming
+        online request.
+
+        Args:
+            seq_group: The incoming online sequence group.
+            blocks_to_swap_out: Recording all blocks to be swapped out.
+        Returns:
+            True if preempting offline requests will make enough room.
+        """
+        if seq_group.is_offline:
+            return False
+
+        status = seq_group.get_seqs()[0].status
+        if status == SequenceStatus.SWAPPED:
+            can_schedule = self.block_manager.can_swap_in_with(
+                seq_group, self.offline_running,
+                self.scheduler_config.preemption_mode)
+        elif status == SequenceStatus.WAITING:
+            can_schedule = self.block_manager.can_allocate_with(
+                seq_group, self.offline_running,
+                self.scheduler_config.preemption_mode)
+        else:
+            raise ValueError(f"Unexpected sequence status: {status}")
+        if can_schedule != AllocStatus.OK:
+            return False
+
+        while self.offline_running:
+            if status == SequenceStatus.SWAPPED:
+                can_schedule = self.block_manager.can_swap_in(seq_group)
+            elif status == SequenceStatus.WAITING:
+                can_schedule = self.block_manager.can_allocate(seq_group)
+            else:
+                raise ValueError(f"Unexpected sequence status: {status}")
+            if can_schedule == AllocStatus.OK:
+                break
+
+            victim_seq_group = self.offline_running.pop()
+            preemption_mode = self._preempt(
+                victim_seq_group=victim_seq_group,
+                preempted=self.offline_preempted,
+                swapped_out=self.offline_swapped_out,
+                blocks_to_swap_out=blocks_to_swap_out)
+            if preemption_mode == PreemptionMode.RECOMPUTE:
+                offline_preempted.append(victim_seq_group)
+            else:
+                offline_swapped_out.append(victim_seq_group)
+
+        assert can_schedule == AllocStatus.OK
+        return True
