@@ -11,6 +11,7 @@ from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
                                                   LastAccessBlocksTracker)
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
+from vllm.core.scheduler import PreemptionMode
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 from vllm.utils import Device
 
@@ -106,9 +107,13 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         self._last_access_blocks_tracker = LastAccessBlocksTracker(
             self.block_allocator)
 
-    def can_allocate(self,
-                     seq_group: SequenceGroup,
-                     num_lookahead_slots: int = 0) -> AllocStatus:
+    def can_allocate(
+        self,
+        seq_group: SequenceGroup,
+        num_lookahead_slots: int = 0,
+        # Concerto: args to count in offline evictable blocks
+        num_evictable_gpu_blocks: int = 0
+    ) -> AllocStatus:
         # FIXME(woosuk): Here we assume that all sequences in the group share
         # the same prompt. This may not be true for preempted sequences.
 
@@ -135,6 +140,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
         num_free_gpu_blocks = self.block_allocator.get_num_free_blocks(
             device=Device.GPU)
+        num_free_gpu_blocks += num_evictable_gpu_blocks
 
         # Use watermark to avoid frequent cache eviction.
         if (self.num_total_gpu_blocks - num_required_blocks
@@ -343,12 +349,12 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
     def can_swap_in(self, seq_group: SequenceGroup,
                     num_lookahead_slots: int) -> AllocStatus:
-        """Returns the AllocStatus for the given sequence_group 
+        """Returns the AllocStatus for the given sequence_group
         with num_lookahead_slots.
 
         Args:
             sequence_group (SequenceGroup): The sequence group to swap in.
-            num_lookahead_slots (int): Number of lookahead slots used in 
+            num_lookahead_slots (int): Number of lookahead slots used in
                 speculative decoding, default to 0.
 
         Returns:
@@ -365,7 +371,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             seq_group (SequenceGroup): The sequence group to swap in.
 
         Returns:
-            List[Tuple[int, int]]: The mapping of swapping block from CPU 
+            List[Tuple[int, int]]: The mapping of swapping block from CPU
                 to GPU.
         """
         physical_block_id_mapping = []
@@ -395,12 +401,12 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         return physical_block_id_mapping
 
     def can_swap_out(self, seq_group: SequenceGroup) -> bool:
-        """Returns whether we can swap out the given sequence_group 
+        """Returns whether we can swap out the given sequence_group
         with num_lookahead_slots.
 
         Args:
             seq_group (SequenceGroup): The sequence group to swap out.
-            num_lookahead_slots (int): Number of lookahead slots used in 
+            num_lookahead_slots (int): Number of lookahead slots used in
                 speculative decoding, default to 0.
 
         Returns:
@@ -418,7 +424,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             sequence_group (SequenceGroup): The sequence group to swap out.
 
         Returns:
-            List[Tuple[int, int]]: The mapping of swapping block from 
+            List[Tuple[int, int]]: The mapping of swapping block from
                 GPU to CPU.
         """
         physical_block_id_mapping = []
@@ -459,12 +465,16 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
     def reset_prefix_cache(self, device: Optional[Device] = None) -> bool:
         return self.block_allocator.reset_prefix_cache(device)
 
-    def _can_swap(self,
-                  seq_group: SequenceGroup,
-                  device: Device,
-                  status: SequenceStatus,
-                  num_lookahead_slots: int = 0) -> AllocStatus:
-        """Returns the AllocStatus for swapping in/out the given sequence_group 
+    def _can_swap(
+        self,
+        seq_group: SequenceGroup,
+        device: Device,
+        status: SequenceStatus,
+        num_lookahead_slots: int = 0,
+        # Concerto: args to count in offline evictable blocks
+        num_evictable_gpu_blocks: int = 0,
+    ) -> AllocStatus:
+        """Returns the AllocStatus for swapping in/out the given sequence_group
         on to the 'device'.
 
         Args:
@@ -472,11 +482,13 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             device (Device): device to swap the 'seq_group' on.
             status (SequenceStatus): The status of sequence which is needed
                 for action. RUNNING for swap out and SWAPPED for swap in
-            num_lookahead_slots (int): Number of lookahead slots used in 
+            num_lookahead_slots (int): Number of lookahead slots used in
                 speculative decoding, default to 0.
+            num_evictable_gpu_blocks (int): Number of evictable GPU blocks,
+                default to 0.
 
         Returns:
-            AllocStatus: The AllocStatus for swapping in/out the given 
+            AllocStatus: The AllocStatus for swapping in/out the given
                 sequence_group on to the 'device'.
         """
         # First determine the number of blocks that will be touched by this
@@ -507,8 +519,9 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         if self.block_allocator.get_num_total_blocks(
                 device) < num_blocks_touched:
             return AllocStatus.NEVER
-        elif self.block_allocator.get_num_free_blocks(
-                device) - num_blocks_touched >= watermark_blocks:
+        elif (self.block_allocator.get_num_free_blocks(device) +
+              num_evictable_gpu_blocks - num_blocks_touched
+              >= watermark_blocks):
             return AllocStatus.OK
         else:
             return AllocStatus.LATER
@@ -518,3 +531,65 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         cached in the block manager for the sequence.
         """
         return self._computed_blocks_tracker.get_num_cached_tokens(seq)
+
+    # Concerto: interfaces for scheduling with offline evictable blocks
+    def can_allocate_with(self, seq_group: SequenceGroup,
+                          offline_seq_groups: List[SequenceGroup],
+                          preemption_mode: PreemptionMode) -> AllocStatus:
+        num_evictable_gpu_blocks = self._num_evictable_blocks(
+            offline_seq_groups, preemption_mode)
+        return self.can_allocate(seq_group, num_evictable_gpu_blocks)
+
+    def can_swap_in_with(self, seq_group: SequenceGroup,
+                         offline_seq_groups: List[SequenceGroup],
+                         preemption_mode: PreemptionMode) -> AllocStatus:
+        num_evictable_gpu_blocks = self._num_evictable_blocks(
+            offline_seq_groups, preemption_mode)
+
+        return self._can_swap(seq_group, Device.GPU, SequenceStatus.SWAPPED,
+                              num_evictable_gpu_blocks)
+
+    def _num_evictable_blocks(self, offline_seq_groups: List[SequenceGroup],
+                              preemption_mode: PreemptionMode) -> int:
+        num_evictable_gpu_blocks, num_needed_cpu_blocks = 0, 0
+        for sg in offline_seq_groups:
+            eb, nb = self._sg_num_swappable_blocks(sg)
+            num_evictable_gpu_blocks += eb
+            num_needed_cpu_blocks += nb
+        if preemption_mode == PreemptionMode.RECOMPUTE:
+            # No CPU blocks are needed for recompute.
+            num_needed_cpu_blocks = 0
+
+        num_free_cpu_blocks = self.block_allocator.get_num_free_blocks(
+            Device.CPU)
+        if num_needed_cpu_blocks > num_free_cpu_blocks:
+            # We can only evict GPU blocks when CPU blocks are available.
+            num_evictable_gpu_blocks -= (num_needed_cpu_blocks -
+                                         num_free_cpu_blocks)
+        return num_evictable_gpu_blocks
+
+    def _sg_num_swappable_blocks(self,
+                                 seq_group: SequenceGroup) -> Tuple[int, int]:
+        # TODO: (YIFAN): update num_blocks_touched after adding checkpointing
+        # support.
+        num_evictable_blocks = 0
+        num_blocks_touched = 0
+        blocks: List[Block] = []
+        for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
+            block_table = self.block_tables[seq.seq_id]
+            if block_table.blocks is not None:
+                num_evictable_blocks += len(block_table.blocks)
+                # Compute the number blocks to touch for the tokens to be
+                # appended. This does NOT include the full blocks that need
+                # to be touched for the swap.
+                num_blocks_touched += \
+                    block_table.get_num_blocks_touched_by_append_slots(
+                        block_table.get_unseen_token_ids(seq.get_token_ids()),
+                        num_lookahead_slots=0)
+                blocks.extend(block_table.blocks)
+        # Compute the number of full blocks to touch and add it to the
+        # existing count of blocks to touch.
+        num_blocks_touched += self.block_allocator.get_num_full_blocks_touched(
+            blocks, device=Device.CPU)
+
+        return num_evictable_blocks, num_blocks_touched

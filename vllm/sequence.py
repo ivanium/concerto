@@ -112,12 +112,12 @@ class RequestMetrics:
                             will include model forward, block/sync across
                             workers, cpu-gpu sync time and sampling time.
         spec_token_acceptance_counts: number of accepted speculative tokens at
-                                      each position; the first token is from 
+                                      each position; the first token is from
                                       the target model and is always accepted;
-                                      e.g., when it's [10, 8, 4, 2] for a req, 
+                                      e.g., when it's [10, 8, 4, 2] for a req,
                                       it means there were 10 forward passes in
-                                      total, and there were 8, 4, 2 accepted 
-                                      tokens at 1st, 2nd, 3rd speculation step. 
+                                      total, and there were 8, 4, 2 accepted
+                                      tokens at 1st, 2nd, 3rd speculation step.
     """
     arrival_time: float
     last_token_time: float
@@ -647,25 +647,29 @@ class SequenceGroup:
         trace_headers: OpenTelemetry trace headers.
         prompt_adapter_request: Prompt Adapter request.
         priority: User-defined priority of the request.
-        draft_size: The number of speculative tokens plus one from the target 
+        draft_size: The number of speculative tokens plus one from the target
                     model; equal to max number of tokens a step can generate
-                    for single-draft speculative decoding but larger than 
+                    for single-draft speculative decoding but larger than
                     that for multi-draft SD (currently not supported).
     """
 
-    def __init__(self,
-                 request_id: str,
-                 seqs: list[Sequence],
-                 arrival_time: float,
-                 sampling_params: Optional[SamplingParams] = None,
-                 lora_request: Optional[LoRARequest] = None,
-                 pooling_params: Optional[PoolingParams] = None,
-                 pooled_data: Optional[torch.Tensor] = None,
-                 encoder_seq: Optional[Sequence] = None,
-                 trace_headers: Optional[Mapping[str, str]] = None,
-                 prompt_adapter_request: Optional[PromptAdapterRequest] = None,
-                 priority: int = 0,
-                 draft_size: int = 1) -> None:
+    ONLINE_PRIORITY: int = 0
+    OFFLINE_PRIORITY: int = 1000
+
+    def __init__(
+            self,
+            request_id: str,
+            seqs: list[Sequence],
+            arrival_time: float,
+            sampling_params: Optional[SamplingParams] = None,
+            lora_request: Optional[LoRARequest] = None,
+            pooling_params: Optional[PoolingParams] = None,
+            pooled_data: Optional[torch.Tensor] = None,
+            encoder_seq: Optional[Sequence] = None,
+            trace_headers: Optional[Mapping[str, str]] = None,
+            prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+            priority: int = ONLINE_PRIORITY,  # Concerto only
+            draft_size: int = 1) -> None:
         self.request_id = request_id
         self.seqs = seqs
         self.first_seq = seqs[0]
@@ -693,6 +697,25 @@ class SequenceGroup:
         self.priority = priority
 
         self.cached_request_output = None
+
+    # Concerto interfaces
+    @property
+    def is_online(self) -> bool:
+        """
+        Concerto only. Check if the request is online.
+        """
+        assert (self.priority == SequenceGroup.ONLINE_PRIORITY or
+                self.priority == SequenceGroup.OFFLINE_PRIORITY)
+        return self.priority == SequenceGroup.ONLINE_PRIORITY
+
+    @property
+    def is_offline(self) -> bool:
+        """
+        Concerto only. Check if the request is offline.
+        """
+        assert (self.priority == SequenceGroup.ONLINE_PRIORITY or
+                self.priority == SequenceGroup.OFFLINE_PRIORITY)
+        return self.priority == SequenceGroup.OFFLINE_PRIORITY
 
     @property
     def prompt(self) -> Optional[str]:

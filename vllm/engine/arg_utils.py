@@ -194,7 +194,13 @@ class EngineArgs:
     otlp_traces_endpoint: Optional[str] = None
     collect_detailed_traces: Optional[str] = None
     disable_async_output_proc: bool = False
-    scheduling_policy: Literal["fcfs", "priority"] = "fcfs"
+    scheduling_policy: Literal[
+        "fcfs",  # Orignal
+        "priority",
+        "concerto",  # Concerto added
+        "coserve-nonpreempt",
+        "coserve-preempt",
+    ] = "fcfs"
     scheduler_cls: Union[str, Type[object]] = "vllm.core.scheduler.Scheduler"
 
     override_neuron_config: Optional[Dict[str, Any]] = None
@@ -865,13 +871,19 @@ class EngineArgs:
 
         parser.add_argument(
             '--scheduling-policy',
-            choices=['fcfs', 'priority'],
+            choices=[
+                'fcfs', 'priority', 'concerto', 'coserve-nonpreempt',
+                'coserve-preempt'
+            ],
             default="fcfs",
             help='The scheduling policy to use. "fcfs" (first come first served'
             ', i.e. requests are handled in order of arrival; default) '
             'or "priority" (requests are handled based on given '
             'priority (lower value means earlier handling) and time of '
-            'arrival deciding any ties).')
+            'arrival deciding any ties).'
+            'Concerto specific: "concerto" (Concerto scheduling policy)'
+            '"coserve-nonpreempt" (CoServe non-preemptive baseline)'
+            '"coserve-preempt" (CoServe preemptive baseline)')
 
         parser.add_argument(
             '--scheduler-cls',
@@ -1749,7 +1761,7 @@ def _warn_or_fallback(feature_name: str) -> bool:
 def human_readable_int(value):
     """Parse human-readable integers like '1k', '2M', etc.
     Including decimal values with decimal multipliers.
-    
+
     Examples:
     - '1k' -> 1,000
     - '1K' -> 1,024

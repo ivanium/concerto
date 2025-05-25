@@ -33,6 +33,7 @@ from vllm.inputs import (INPUT_REGISTRY, InputRegistry, ProcessorInputs,
                          PromptType, SingletonInputs)
 from vllm.inputs.parse import is_token_prompt, split_enc_dec_inputs
 from vllm.inputs.preprocess import InputPreprocessor
+from vllm.latency_tracker import LatencyTracker
 from vllm.logger import init_logger
 from vllm.logits_process import get_bad_words_logits_processors
 from vllm.lora.request import LoRARequest
@@ -423,6 +424,9 @@ class LLMEngine:
         # the next step without re-scheduling.
         self._skip_scheduling_next_step = False
 
+        # Concerto request tracking
+        self.latency_tracker = LatencyTracker()
+
     def _initialize_kv_caches(self) -> None:
         """Initialize the KV cache in the worker(s).
 
@@ -759,9 +763,16 @@ class LLMEngine:
             raise ValueError(f"Got lora_request {lora_request} but LoRA is "
                              "not enabled!")
 
-        if priority != 0 and not self.scheduler_config.policy == "priority":
+        if (priority != SequenceGroup.ONLINE_PRIORITY
+                and priority != SequenceGroup.OFFLINE_PRIORITY
+                and not self.scheduler_config.policy == "priority"):
             raise ValueError(f"Got priority {priority} but "
                              "Priority scheduling is not enabled.")
+        if (priority == SequenceGroup.OFFLINE_PRIORITY
+                and self.scheduler_config.policy
+                not in ["concerto", "coserve-nonpreempt", "coserve-preempt"]):
+            raise ValueError(f"Got offline requests but "
+                             "Concerto scheduling is not enabled.")
 
         if isinstance(params, SamplingParams) \
             and (params.guided_decoding or params.logits_processors) \
@@ -784,6 +795,9 @@ class LLMEngine:
             prompt_adapter_request=prompt_adapter_request,
         )
         processed_inputs = self.input_processor(preprocessed_inputs)
+
+        # Concerto logging. Tracking the arrival time of the request.
+        self.latency_tracker.add_arrival_time(request_id, arrival_time)
 
         self._add_processed_request(
             request_id=request_id,
@@ -934,22 +948,26 @@ class LLMEngine:
         """Gets the LoRA configuration."""
         return self.lora_config
 
-    def get_num_unfinished_requests(self) -> int:
+    def get_num_unfinished_requests(self, offline: bool = False) -> int:
         """Gets the number of unfinished requests."""
-        return sum(scheduler.get_num_unfinished_seq_groups()
-                   for scheduler in self.scheduler)
+        return sum(
+            scheduler.get_num_unfinished_seq_groups(offline)
+            for scheduler in self.scheduler)
 
-    def has_unfinished_requests(self) -> bool:
+    def has_unfinished_requests(self, offline: bool = False) -> bool:
         """Returns True if there are unfinished requests."""
-        return any(scheduler.has_unfinished_seqs()
-                   for scheduler in self.scheduler)
+        return any(
+            scheduler.has_unfinished_seqs(offline)
+            for scheduler in self.scheduler)
 
-    def has_unfinished_requests_for_virtual_engine(
-            self, virtual_engine: int) -> bool:
+    def has_unfinished_requests_for_virtual_engine(self,
+                                                   virtual_engine: int,
+                                                   offline: bool = False
+                                                   ) -> bool:
         """
         Returns True if there are unfinished requests for the virtual engine.
         """
-        return self.scheduler[virtual_engine].has_unfinished_seqs()
+        return self.scheduler[virtual_engine].has_unfinished_seqs(offline)
 
     def reset_prefix_cache(self, device: Optional[Device] = None) -> bool:
         """Reset prefix cache for all devices."""
@@ -1141,6 +1159,9 @@ class LLMEngine:
                 if seq_group_meta.do_sample:
                     self.output_processor.process_outputs(
                         seq_group, output, is_async)
+                    # Concerto logging. Tracking TTFT and ITL.
+                    self.latency_tracker.add_token_time(
+                        seq_group.request_id, now)
 
             if seq_group.is_finished():
                 finished_now.append(i)
@@ -1289,7 +1310,10 @@ class LLMEngine:
                 else:
                     seq.append_token_id(sample.output_token, sample.logprobs)
 
-    def step(self) -> List[Union[RequestOutput, PoolingRequestOutput]]:
+    def step(
+        self,
+        schedule_offline: bool = False
+    ) -> List[Union[RequestOutput, PoolingRequestOutput]]:
         """Performs one decoding iteration and returns newly generated results.
 
         .. figure:: https://i.imgur.com/sv2HssD.png
@@ -1372,7 +1396,7 @@ class LLMEngine:
             # Schedule iteration
             (seq_group_metadata_list, scheduler_outputs,
              allow_async_output_proc
-             ) = self.scheduler[virtual_engine].schedule()
+             ) = self.scheduler[virtual_engine].schedule(schedule_offline)
 
             ctx.seq_group_metadata_list = seq_group_metadata_list
             ctx.scheduler_outputs = scheduler_outputs
